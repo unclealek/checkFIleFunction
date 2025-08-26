@@ -1,45 +1,39 @@
+import os
+import logging
 from google.cloud import storage
+import functions_framework  # pip install functions-framework
 
-# define the destination bucket for invalid files
+INVALID_FILES_BUCKET = os.environ.get("INVALID_FILES_BUCKET", "2mb-bucket")
+MAX_SIZE = 2 * 1024 * 1024  # 2 MB
 
-INVALID_FILES_BUCKET = "2mb-bucket"
+storage_client = storage.Client()
 
-def check_file_size_and_move(event, context):
-    """Triggered by a change to the GCS bucket.
-    Args:
-        event (dict): The event payload.
-        context (google.cloud.functions.Context): The event metadata.
-    """
-    
-    # get the file name and size from the event payload
-    source_bucket_name = event['bucket']
-    file_name = event['name']
-    
-    #Initialize GCS client
-    storage_client = storage.Client()
-    source_bucket = storage_client.bucket(source_bucket_name)
+@functions_framework.cloud_event
+def check_file_size_and_move(cloud_event):
+    data = cloud_event.data or {}
+    bucket_name = data.get("bucket")
+    file_name = data.get("name")
+
+    if not bucket_name or not file_name:
+        logging.warning("Missing bucket or name in event")
+        return "Bad event", 200  # don’t trigger retries for malformed events
+
+    source_bucket = storage_client.bucket(bucket_name)
     blob = source_bucket.blob(file_name)
-
-    # Reload the blob to ensure the file size is fetched
     blob.reload()
-    
-    # Get the file size in bytes
-    file_size = blob.size
-    
-    # Ensure the file size is not None
-    if file_size is None:
-        print(f"File size is None for {file_name}. skipping...")
-        return
-    
-    max_size = 2 * 1024 * 1024   # 2MB in bytes
-     
-    if file_size > max_size:
-        # Move the file to the "large_files/" folder in the destination bucket
-        destination_bucket = storage_client.bucket(INVALID_FILES_BUCKET)
-        new_blob_name = f"large_files/{file_name}"  # Add folder prefix
-        new_blob = source_bucket.copy_blob(blob, destination_bucket, new_blob_name)
-        # Delete the original file
+    size = blob.size
+
+    if size is None:
+        logging.warning(f"Size is None for {file_name}")
+        return "No size", 200
+
+    if size > MAX_SIZE:
+        dest_bucket = storage_client.bucket(INVALID_FILES_BUCKET)
+        new_name = f"large_files/{file_name}"
+        source_bucket.copy_blob(blob, dest_bucket, new_name)
         blob.delete()
-        print(f"File size is greater than 2MB for {file_name}. Moved to {INVALID_FILES_BUCKET}/large_files/{file_name} because it exceeded the size limit.")
+        logging.info(f"Moved oversize {file_name} to {INVALID_FILES_BUCKET}/{new_name}")
     else:
-        print(f"{file_name} size is within the limit")
+        logging.info(f"{file_name} is within size limit ({size} bytes)")
+
+    return "OK", 200
